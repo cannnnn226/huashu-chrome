@@ -40,6 +40,28 @@ CLI 是入口（install / mcp / doctor），MCP server 是 agent 的接口，本
 
 ---
 
+## 这个仓库是什么
+
+这是 [alchaincyf/huashu-chrome](https://github.com/alchaincyf/huashu-chrome) 的个人版本，
+`master` 分支 = 官方版本 + 我自己在用的一组灰度功能。
+
+灰度功能都在侧栏的「本地补丁」区，每项一个开关，随时可以关掉回到官方行为：
+
+| 功能 | 干什么 | 官方有吗 |
+|---|---|---|
+| 前台保护 | 页面自己开的新标签留在后台，不再抢走你正在看的那一页 | 已提 [PR #19](https://github.com/alchaincyf/huashu-chrome/pull/19)，未合入 |
+| 标签页回收 | 单个会话最多留 6 个自己开的页，会话离线 15 分钟后整批回收 | 没有 |
+| 前台诊断 | 记录谁把前台切走了，`tabs(list)` 回放最近 20 条 | 没有 |
+| 遗留标签页 | 手动清理会话断开后留下的页（一键，不是开关） | 没有 |
+
+**想用官方版本**，请去 [alchaincyf/huashu-chrome](https://github.com/alchaincyf/huashu-chrome)。
+拉这个仓库等于在这个基础上再改一层，官方更新需要自己合。
+
+**给官方提 PR** 一律从官方 `master` 拉新分支，不带上面这些本地功能；
+上游合入之后，对应的本地灰度项就可以删掉，改走官方实现。
+
+---
+
 ## 看效果
 
 装上之后，你在 agent 里说的是这种话：

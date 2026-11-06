@@ -2008,7 +2008,54 @@
 
   // ---------- 消息入口 ----------
 
+  // 点中 target="_blank" 的链接时，别交给浏览器去开前台新标签——它会让 Chrome 认为
+  // 「用户要开新页」，把前台切走。改成让扩展以 active:false 建页，全程无感。
+  //
+  // 两个前提缺一不可：
+  //   ① 在动作布防窗口内（后台每次动作前调 __hcArmLinks，动作结束调 __hcDisarmLinks）；
+  //   ② 这个点击不是人点的。**真人点击必须放行**——他想在新标签里看，把页开到后台
+  //      背后是纯粹帮倒忙。合成点击（isTrusted=false）才是扩展自己发的。
+  //
+  // 代价：扩展自己的 L2 真实点击（CDP 派发，isTrusted=true）也在这条放行线之外，
+  // 那一拍由护栏兜底把前台还回去，最多闪一帧。分不清「扩展的真实点击」和「人的
+  // 点击」是浏览器的限制，宁可闪一帧也不拦人。
+  //
+  // 捕获阶段 + stopImmediatePropagation：必须抢在站点自己的 click 处理器之前，
+  // 否则它们会先跳转。
+  let armUntil = 0;
+  document.addEventListener('click', (e) => {
+    if (e.isTrusted) return;                 // 人点的，一律不拦
+    if (Date.now() > armUntil) return;
+    const a = e.target?.closest?.('a[href][target="_blank"]');
+    if (!a) return;
+    const href = a.href || '';
+    if (!/^https?:/i.test(href)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    // 不清零布防窗口：同一次动作可能被点两下——合成点击被拦下后页面没有任何变化，
+    // 扩展会判定「没反应」自动升级成真实事件再点一次。清零的话第二下就漏拦，
+    // 浏览器照样自己开页。一次 click 只命中一个链接，留着窗口不会多开。
+    chrome.runtime.sendMessage({ __hcOpenBg: href }).catch(() => { /* 后台没接住就算了 */ });
+  }, true);
+
+  // 页面主世界里 window.open 被拦下后（见 background 的 pageOpenShim），URL 走这条
+  // postMessage 递进来，再由扩展在后台开页——这样浏览器根本不会把前台切过去。
+  window.addEventListener('message', (e) => {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d || d.__hcOpenBg !== true || typeof d.url !== 'string') return;
+    if (!/^https?:/i.test(d.url)) return;
+    chrome.runtime.sendMessage({ __hcOpenBg: d.url }).catch(() => { /* 后台没接住就算了 */ });
+  });
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    // 布防只在这次动作期间有效：动作结束时后台会发 __hcDisarmLinks 立刻撤掉。
+    // 窗口纯粹兜底——撤防消息丢了（页面在动作中导航、内容脚本重载、SW 被回收），
+    // 到期就自动失效，不会一直拦着。3 秒够覆盖一次正常动作（布防到点击是毫秒级），
+    // 又短到即使兜底生效，站点自己的 window.open 也顶多被拦一次。
+    // 真人点击另有 isTrusted 放行，不靠这个窗口。
+    if (msg?.__hcArmLinks) { armUntil = Date.now() + 3000; sendResponse({ ok: true }); return false; }
+    if (msg?.__hcDisarmLinks) { armUntil = 0; sendResponse({ ok: true }); return false; }
     if (!msg || !msg.__hc) return;
     (async () => {
       try {

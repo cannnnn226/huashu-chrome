@@ -111,6 +111,30 @@
       <input type="checkbox" class="toggle" id="mark" />
     </label>
   </section>
+
+  <section>
+    <h2>本地补丁</h2>
+    <label class="sw-row">
+      <span class="txt">总开关<div class="sub">关掉后下面每一项都不生效，行为回到官方原样；出问题先关它对照</div></span>
+      <input type="checkbox" class="toggle" id="patch" />
+    </label>
+    <label class="sw-row patch-child">
+      <span class="txt">前台保护<div class="sub">页面自己开的新标签留在后台；支付确认、传了 focus 的截图和切换标签照常到前台</div></span>
+      <input type="checkbox" class="toggle" id="patchFrontGuard" />
+    </label>
+    <label class="sw-row patch-child">
+      <span class="txt">标签页回收<div class="sub">单会话最多留 6 个自己开的页，会话离线 15 分钟后整批回收；用户自己的页不动</div></span>
+      <input type="checkbox" class="toggle" id="patchReclaim" />
+    </label>
+    <label class="sw-row patch-child">
+      <span class="txt">前台诊断<div class="sub">记录谁把前台切走了，tabs(list) 回放最近 20 条，排「谁抢了我的页面」用</div></span>
+      <input type="checkbox" class="toggle" id="patchFrontLog" />
+    </label>
+    <div class="sw-row patch-child" id="orphanRow">
+      <span class="txt">遗留标签页<div class="sub" id="orphanCount">检查中…</div></span>
+      <button class="btn ghost" id="orphanBtn" disabled>清理</button>
+    </div>
+  </section>
 </main>
 
 <footer>连不上时在终端跑 <code style="padding:1px 5px">npx huashu-chrome doctor</code>，它会告诉你卡在哪一步。</footer>
