@@ -84,7 +84,7 @@ test('侧栏开关与后台读的是同一个键', () => {
 
 test('本地补丁每项一个开关，总开关一关全回官方行为', () => {
   assert.ok(/PATCH_KEYS\s*=\s*\{/.test(background), '找不到 PATCH_KEYS');
-  for (const key of ['localPatchEnabled', 'patchFrontGuard', 'patchReclaim', 'patchFrontLog']) {
+  for (const key of ['localPatchEnabled', 'patchFrontGuard', 'patchReclaim']) {
     assert.ok(background.includes(`'${key}'`), `开关 ${key} 不见了`);
   }
   // 未设置算开：装上就生效，只有明确存 false 才算关
@@ -108,7 +108,6 @@ test('侧栏默认全开，总开关关掉时子项禁用', () => {
   assert.ok(/checked\s*=\s*[^;]*!==\s*false/.test(panelJs), '侧栏开关默认应为开');
   assert.ok(panelHtml.includes('id="patchFrontGuard"'), '缺前台保护开关');
   assert.ok(panelHtml.includes('id="patchReclaim"'), '缺标签页回收开关');
-  assert.ok(panelHtml.includes('id="patchFrontLog"'), '缺前台诊断开关');
 });
 
 test('无痕窗口不参与盖章与清理', () => {

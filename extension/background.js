@@ -632,37 +632,6 @@ async function noteSession(sid, client, live) {
 
 const liveList = async () => (await chrome.storage.session.get(LIVE_SIDS))[LIVE_SIDS] || [];
 
-// ---------- 前台切换诊断（本地） ----------
-//
-// 「打开一个页面，前台就被抢走」这类问题，命令回执里看不出来：激活可能来自浏览器
-// 自己（window.open 的默认行为）、可能来自别的工具，也可能来自用户手滑。而且窗口
-// 不在前台时肉眼看不见，只有切回来才发现「刚才不是我点的那页」。
-//
-// chrome.tabs.onActivated 是唯一的全局事实源——谁把哪一页切成了前台、那一刻窗口
-// 有没有焦点，全记下来。tabs(action:"list") 回放最近 20 条，对时间点即可定位。
-// 纯诊断：任何异常都吞掉，绝不影响命令本身。
-const FRONT_LOG = 'frontLog';
-const FRONT_LOG_CAP = 20;
-
-chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
-  if (!patchOn('frontLog')) return;
-  try {
-    const [{ [FRONT_LOG]: log = [] }, tab, win] = await Promise.all([
-      chrome.storage.local.get(FRONT_LOG),
-      chrome.tabs.get(tabId).catch(() => null),
-      chrome.windows.get(windowId).catch(() => null),
-    ]);
-    log.push({
-      t: Date.now(),
-      tabId,
-      focused: !!win?.focused,   // 切的那一下窗口有没有焦点——「焦点不在浏览器就不出现」的判据
-      title: String(tab?.title || '').slice(0, 40),
-      url: String(tab?.url || '').slice(0, 100),
-    });
-    await chrome.storage.local.set({ [FRONT_LOG]: log.slice(-FRONT_LOG_CAP) });
-  } catch { /* 诊断失败不该影响任何命令 */ }
-});
-
 // ---------- agent 标签页回收 ----------
 //
 // agent 每搜一次就 tabs(action:"new") 开一个页，读完不关——一个研究任务能堆出
@@ -690,13 +659,12 @@ const PATCH_KEYS = {
   master: 'localPatchEnabled',    // 总开关
   frontGuard: 'patchFrontGuard',  // 前台保护：拦截开页 + 护栏兜底
   reclaim: 'patchReclaim',        // 标签页回收：盖章、单会话上限、离线清理
-  frontLog: 'patchFrontLog',      // 前台切换诊断日志
 };
 const PATCH_KEY_SET = new Set(Object.values(PATCH_KEYS));
 
 // 缓存进内存：归还前台要赶在浏览器画出第一帧之前，这条路径上多一次 storage
 // 读取就够它闪一下。变化时同步。
-let patchCfg = { master: true, frontGuard: true, reclaim: true, frontLog: true };
+let patchCfg = { master: true, frontGuard: true, reclaim: true };
 const readPatchCfg = (all) => {
   const cfg = {};
   for (const [k, key] of Object.entries(PATCH_KEYS)) cfg[k] = all[key] !== false;
@@ -2840,15 +2808,9 @@ const HANDLERS = {
         const grp = t.groupId === -1 ? '' : ourGids.has(t.groupId) ? `⟨组${String(t.groupId).slice(-3)}⟩` : '⟨别组⟩';
         return `[${t.id}]${mark}${grp}${lb ? `「${lb}」` : ''} ${t.title || '(无标题)'} — ${t.url}`;
       });
-      const { [FRONT_LOG]: frontLog = [] } = await chrome.storage.local.get(FRONT_LOG);
-      const front = frontLog.slice(-8).map((r) => {
-        const at = new Date(r.t).toLocaleTimeString('zh-CN', { hour12: false });
-        return `  ${at}${r.focused ? ' 前台' : ' 后台'} → [${r.tabId}] ${r.title || r.url}`;
-      });
       return {
         text: `共 ${all.length} 个标签页（* = 你的缺省槽，+ = 你的另一条工作线，× = 别的会话在用；⟨组NNN⟩ = 我们的标签组；「」= 开页时声明的 label）\n`
-          + lines.join('\n')
-          + (front.length ? `\n\n最近的前台切换（本地诊断，看谁把前台抢走了）：\n${front.join('\n')}` : ''),
+          + lines.join('\n'),
       };
     }
     // active:false —— agent 在后台干活，不把用户从他正在看的页面上拽走。

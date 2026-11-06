@@ -5,7 +5,6 @@
 //
 //   标签页回收  数页数（不打扰用户）
 //   前台保护    点一个 target=_blank 链接，看 Chrome 有没有把子页切到前台
-//   前台诊断    切一次标签，看诊断日志最后一条记的是不是那一页
 //
 // 后两项会切前台、会动用户的窗口。只在用户明确授权时跑。
 //
@@ -58,14 +57,6 @@ async function closeTabs(ids) {
   for (const id of ids) await c.call('tabs', { action: 'close', tabId: id }).catch(() => {});
 }
 
-// 诊断日志最后一条记的 tabId。没有记录返回 null
-async function lastFrontLogTab() {
-  const l = await c.call('tabs', { action: 'list' });
-  const tail = l.text.split('最近的前台切换')[1] || '';
-  const hits = [...tail.matchAll(/→ \[(\d+)\]/g)];
-  return hits.length ? Number(hits[hits.length - 1][1]) : null;
-}
-
 before(async () => {
   server = http.createServer((req, res) => {
     const name = (req.url || '/').split('?')[0].replace(/^\//, '') || 'newtab.html';
@@ -86,7 +77,7 @@ after(async () => {
   // 先关掉本次测试开过的所有页，再恢复开关
   for (const id of new Set(opened)) await c?.call('tabs', { action: 'close', tabId: id }).catch(() => {});
   // 无论成败都把开关恢复默认，别把用户的浏览器留在奇怪状态
-  for (const key of ['localPatchEnabled', 'patchReclaim', 'patchFrontGuard', 'patchFrontLog']) {
+  for (const key of ['localPatchEnabled', 'patchReclaim', 'patchFrontGuard']) {
     await setSwitch(key, true).catch(() => {});
   }
   c?.close();
@@ -151,26 +142,3 @@ test('前台保护开着：页面里装上替换', async () => {
   assert.equal(await shimInstalled(), true, '开着前台保护时应该注入拦截');
 });
 
-test('前台诊断关着：切标签不产生新记录', async () => {
-  await setSwitch('patchFrontLog', false);
-  const r = await c.call('tabs', { action: 'new', url: `https://example.com/?${TAG}-diag-off=${Date.now()}`, label: `${TAG}-diagoff` });
-  const target = r.tabId;
-  await sleep(600);
-  await c.call('tabs', { action: 'select', tabId: target, focus: true }).catch(() => {});
-  await sleep(1200);
-  const last = await lastFrontLogTab();
-  await closeTabs([target]);
-  assert.notEqual(last, target, '诊断关掉后不该记到这次切换');
-});
-
-test('前台诊断开着：切标签会记下来', async () => {
-  await setSwitch('patchFrontLog', true);
-  const r = await c.call('tabs', { action: 'new', url: `https://example.com/?${TAG}-diag-on=${Date.now()}`, label: `${TAG}-diagon` });
-  const target = r.tabId;
-  await sleep(600);
-  await c.call('tabs', { action: 'select', tabId: target, focus: true }).catch(() => {});
-  await sleep(1200);
-  const last = await lastFrontLogTab();
-  await closeTabs([target]);
-  assert.equal(last, target, `诊断开着时最后一条应该是 [${target}]，实际是 ${last}`);
-});

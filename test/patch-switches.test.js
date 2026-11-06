@@ -21,7 +21,6 @@ const panelJs = fs.readFileSync(path.join(ROOT, 'extension/panel.js'), 'utf8');
 const FEATURES = [
   { key: 'patchFrontGuard', label: '前台保护', marker: "patchOn('frontGuard')", panel: 'patchFrontGuard' },
   { key: 'patchReclaim', label: '标签页回收', marker: "patchOn('reclaim')", panel: 'patchReclaim' },
-  { key: 'patchFrontLog', label: '前台诊断', marker: "patchOn('frontLog')", panel: 'patchFrontLog' },
 ];
 
 test('每个功能都有开关，且开关键在后台与面板一致', () => {

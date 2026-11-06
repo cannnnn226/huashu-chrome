@@ -230,7 +230,6 @@ const PATCH_KEYS = {
   patch: 'localPatchEnabled',
   patchFrontGuard: 'patchFrontGuard',
   patchReclaim: 'patchReclaim',
-  patchFrontLog: 'patchFrontLog',
 };
 const PATCH_SWITCHES = Object.keys(PATCH_KEYS);
 
