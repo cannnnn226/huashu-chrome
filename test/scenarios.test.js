@@ -59,6 +59,19 @@ before(async () => {
 
 after(async () => {
   try { await c.call('tabs', { action: 'close' }); } catch { /* 已经关了 */ }
+  // 只关受控槽那一个不够：用例里还会开出子页（target=_blank 那几个），
+  // 它们不在槽上，收尾时得按地址扫一遍，否则用户的标签栏里留一堆靶场页。
+  try {
+    const l = await c.call('tabs', { action: 'list' });
+    const junk = [...l.text.matchAll(/\[(\d+)\][^\n]*127\.0\.0\.1:8124/g)].map((m) => Number(m[1]));
+    for (const id of junk) await c.call('tabs', { action: 'close', tabId: id }).catch(() => {});
+  } catch { /* 列表拿不到就算了，别挡住后面的提示 */ }
+  // 这一轮导航了几百次，全写进用户的浏览历史里了。扩展不再为此申请 history 权限
+  // （那等于为了测试便利读全部浏览历史），改成跑完提示一句，需要时手动清。
+  console.log(`\n提示：本轮往浏览历史里写了几百条 ${PAGE} 的记录。`);
+  console.log('要清掉的话，完全退出 Chrome 后执行：');
+  console.log(`  sqlite3 "~/Library/Application Support/Google/Chrome/Default/History" \\`);
+  console.log(`    "DELETE FROM visits WHERE url LIKE 'http://127.0.0.1:${PORT}/%'; DELETE FROM urls WHERE url LIKE 'http://127.0.0.1:${PORT}/%';"`);
   c?.close();          // 不关的话一条开着的 WebSocket 会把进程永远吊住
   server?.close();
   server6?.close();

@@ -190,6 +190,7 @@ async function renderConn(sessionCount) {
 async function refreshAll() {
   const rows = await renderSessions();
   await renderConn(rows.length);
+  await refreshOrphans();   // 每轮刷新都重新盘点一次遗留页，别让计数停在开面板那一刻
 }
 
 $('reconn').onclick = async () => {
@@ -221,6 +222,66 @@ $('mark').onchange = async (e) => {
   await send({ __hcPopup: 'markSync' });
   refreshAll();
 };
+
+// 本地补丁：总开关 + 每项独立开关。总开关关掉时子项置灰，避免「开着但不起作用」
+// 的错觉；每项未设置时默认开，只有明确存了 false 才算关——和 background 同一套判据。
+// 元素 id 与存储键分开：总开关沿用 localPatchEnabled，旧数据不用迁移。
+const PATCH_KEYS = {
+  patch: 'localPatchEnabled',
+  patchFrontGuard: 'patchFrontGuard',
+  patchReclaim: 'patchReclaim',
+};
+const PATCH_SWITCHES = Object.keys(PATCH_KEYS);
+
+chrome.storage.local.get(Object.values(PATCH_KEYS), (cfg) => {
+  for (const [id, key] of Object.entries(PATCH_KEYS)) $(id).checked = cfg[key] !== false;
+  syncPatchDisabled();
+  refreshOrphans();
+});
+
+for (const [id, key] of Object.entries(PATCH_KEYS)) {
+  $(id).onchange = async (e) => {
+    await chrome.storage.local.set({ [key]: e.target.checked });
+    if (id === 'patch') syncPatchDisabled();
+    refreshOrphans();
+  };
+}
+
+// 总开关关着时，子项虽然还能点但一律不生效，置灰比让人猜更直接
+function syncPatchDisabled() {
+  const master = $('patch').checked;
+  for (const id of PATCH_SWITCHES.slice(1)) {
+    $(id).disabled = !master;
+    $(id).closest('.sw-row').style.opacity = master ? '' : '0.45';
+  }
+  $('orphanRow').style.opacity = master ? '' : '0.45';
+}
+
+// 遗留页 = 花叔标签组里、已经没有在线会话占着的页。补丁装上前开的页没有
+// 「谁开的」记号，不能自动关——混在组里的可能还有用户自己交给 agent 的页，
+// 所以只给数着关的入口，点一下才动。
+async function refreshOrphans() {
+  const on = $('patch').checked;
+  $('orphanRow').style.display = on ? '' : 'none';
+  if (!on) return;
+  const r = await send({ __hcPopup: 'orphans' });
+  const n = r?.count || 0;
+  $('orphanCount').textContent = n ? `${n} 个页已经没有 agent 在用` : '没有遗留页';
+  $('orphanBtn').disabled = !n;
+  $('orphanBtn').title = n ? '' : '花叔标签组里没有已离线会话留下的页面，所以没有可清的';
+}
+
+$('orphanBtn').onclick = async () => {
+  const r = await send({ __hcPopup: 'orphans' });
+  if (!r?.count) return;
+  if (!confirm(`关闭花叔标签组里 ${r.count} 个已离线会话留下的页面？\n\n这些页已经没有 agent 在用了，关掉不会打断任何会话。`)) return;
+  const done = await send({ __hcPopup: 'reclaimOrphans' });
+  $('orphanCount').textContent = `已关闭 ${done?.closed || 0} 个`;
+  $('orphanBtn').disabled = true;
+  setTimeout(refreshOrphans, 1500);
+};
+
+refreshOrphans();
 
 // ---------- 订阅 ----------
 

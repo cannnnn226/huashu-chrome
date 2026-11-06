@@ -12,7 +12,7 @@ import * as cdp from './cdp.js';
 import { compat, compatNote } from './compat.js';
 import { matchChallenge, hostOf, hostMatches, L2_ORIGINS_SEED } from './risk.js';
 import { CRED_URL, redactCreds } from './redact.js';
-import { identityOf, stripMarkPrefix } from './identity.js';
+import { identityOf, stripMarkPrefix, MARK_PALETTE } from './identity.js';
 import { validateScript, condText, repeatMax, EXEC_BUDGET, collectRefs, toRecipe } from './script.js';
 
 // ---------- 连接层 ----------
@@ -292,6 +292,9 @@ const NO_SLOT_CMDS = new Set(['tabs', 'download', 'reload', 'status']);
 async function onMessage(msg) {
   if (msg.type === 'event') return onBridgeEvent(msg);
   if (msg.type !== 'cmd') return;
+  // 护栏只服务于「上一条动作」，生命周期到这条命令为止。这样 ask / 支付确认 /
+  // 截图 focus 这些显式要前台的动作不必各自知道护栏的存在——它们天然就不受管。
+  frontGuard = null;
   try {
     const handler = HANDLERS[msg.cmd];
     if (!handler) throw err('INTERNAL', `未知命令 ${msg.cmd}`);
@@ -439,8 +442,9 @@ async function multiLineNote(sid, explicitTab, cmd, resolved) {
 // 操作同一个标签页。
 function onBridgeEvent(msg) {
   if (msg.event !== 'sessions') return;
-  // 先落盘再重算：resyncMarks 里的 ownersOfTab 读的就是 storage 名单
-  return noteSession(null, null, msg.live).then(() => resyncMarks());
+  // 先落盘再重算：resyncMarks 里的 ownersOfTab 读的就是 storage 名单。
+  // 名单一变就顺手扫一遍回收——会话刚刚下线时，它开的页正是最该收的那批。
+  return noteSession(null, null, msg.live).then(() => Promise.all([resyncMarks(), reclaimIdleTabs()]));
 }
 
 const err = (code, message) => Object.assign(new Error(message), { code });
@@ -621,9 +625,158 @@ async function noteSession(sid, client, live) {
   if (sid && client) patch[sidClientKey(sid)] = client;
   if (Array.isArray(live)) patch[LIVE_SIDS] = live;
   if (Object.keys(patch).length) await chrome.storage.session.set(patch).catch(() => {});
+  // 回收判据之一：这个会话最后一条命令的时间。写 local 不写 session——
+  // 「多久没说话了」必须跨浏览器重启可读，而 session storage 重启就空。
+  if (sid) await chrome.storage.local.set({ [lastSeenKey(sid)]: Date.now() }).catch(() => {});
 }
 
 const liveList = async () => (await chrome.storage.session.get(LIVE_SIDS))[LIVE_SIDS] || [];
+
+// ---------- agent 标签页回收 ----------
+//
+// agent 每搜一次就 tabs(action:"new") 开一个页，读完不关——一个研究任务能堆出
+// 几十个页，全部留在用户的标签栏里。用户不敢乱关（关掉可能打断还在跑的会话），
+// 而扩展只管开不管收，这些页于是永远留着。
+//
+// 这里补两条硬规矩，都只动 **agent 自己开的页**：
+//   ① 单会话上限：同一会话自己开的页超过 TAB_CAP 个时，关掉最老的那些；
+//   ② 会话回收：会话离线超过 RECLAIM_GRACE_MS 后，把它开过的页整批关掉。
+//
+// 「自己开的」靠 madeBy:<tabId> 记号认定：tabs(action:"new") 开出来的页、
+// 以及点击/批处理顺带开出并跟过去的新页都会盖章。继承来的页（用户自己的
+// 标签页）从来没有这个记号，所以永远不会被自动关掉——这条边界不能破。
+//
+// 会话在不在线要两个判据合用：
+//   - liveSids（桥推的名单）挡住「会话只是闲着没发命令」被误判成离线；
+//   - lastSeen:<sid>（每条命令刷新）在桥自己挂掉、名单停在旧值时靠时间兜底。
+//
+// 这一整段（连同下面的前台保护）都是**本地补丁**，不是官方行为。侧栏里每项一个
+// 开关，总开关一关全部回到官方原样——出问题先关掉对照，才能把「官方问题」和
+// 「本地改动」分开；以后吸收上游 bugfix 也不至于搅在一起。
+//
+// 每项未设置时默认开：装上就生效，不用一项项去打开。只有明确存了 false 才算关。
+const PATCH_KEYS = {
+  master: 'localPatchEnabled',    // 总开关
+  frontGuard: 'patchFrontGuard',  // 前台保护：拦截开页 + 护栏兜底
+  reclaim: 'patchReclaim',        // 标签页回收：盖章、单会话上限、离线清理
+};
+const PATCH_KEY_SET = new Set(Object.values(PATCH_KEYS));
+
+// 缓存进内存：归还前台要赶在浏览器画出第一帧之前，这条路径上多一次 storage
+// 读取就够它闪一下。变化时同步。
+let patchCfg = { master: true, frontGuard: true, reclaim: true };
+const readPatchCfg = (all) => {
+  const cfg = {};
+  for (const [k, key] of Object.entries(PATCH_KEYS)) cfg[k] = all[key] !== false;
+  return cfg;
+};
+chrome.storage.local.get(null).then((all) => { patchCfg = readPatchCfg(all); }).catch(() => {});
+chrome.storage.onChanged.addListener((ch, area) => {
+  if (area !== 'local') return;
+  if (!Object.keys(ch).some((k) => PATCH_KEY_SET.has(k))) return;
+  chrome.storage.local.get(null).then((all) => { patchCfg = readPatchCfg(all); }).catch(() => {});
+});
+
+// 某项功能此刻是否生效：总开关和它自己都得开着。同步，热路径直接用。
+const patchOn = (k) => patchCfg.master && patchCfg[k];
+
+const localPatchOn = async () => patchCfg.master;
+
+const MADE_PREFIX = 'madeBy:';
+const madeKey = (tabId) => `${MADE_PREFIX}${tabId}`;
+const lastSeenKey = (sid) => `lastSeen:${sid}`;
+const TAB_CAP = 6;                        // 单会话同时保留自己开的页数
+const RECLAIM_GRACE_MS = 15 * 60 * 1000;  // 会话离线多久之后整批回收
+
+// 这页还有别的在线会话占着（继承或显式接管过）→ 不管记号写着谁开的，都不能关。
+const ownedByOtherLive = (all, tabId, sid, live) =>
+  sidsOnTab(all, tabId).some((o) => o !== sid && live.has(o));
+
+// 给 agent 自己开的页盖章。how 只进排查线索，不影响行为。
+//
+// 盖章不看回收开关：那个开关管的是「要不要自动关」，不是「记不记得谁开的」。
+// 早先把它一起判掉，结果是回收关着时开的页既没记号、又盘点不到，成了永远清不掉的
+// 散页。总开关仍然管——关掉就完全回到官方行为，连记号都不留。
+// 无痕窗口里的页不盖章：那是用户私事，自动把它关掉比留着一个页更讨厌。
+async function markMade(sid, tab, how) {
+  if (!sid || !tab?.id || tab.incognito || !(await localPatchOn())) return;
+  await chrome.storage.local.set({ [madeKey(tab.id)]: { sid, at: Date.now(), how } });
+}
+
+// ① 单会话上限。keepTabId 是刚开的那一页，永远不关；剩下的按开页时间从最老的关起。
+// 关页时 onRemoved 会摘掉记号，这里不必再逐个 chrome.tabs.get 校验。
+async function capSessionTabs(sid, keepTabId) {
+  if (!sid || !patchOn('reclaim')) return;
+  const all = await chrome.storage.local.get(null);
+  const mine = Object.entries(all)
+    .filter(([k, v]) => k.startsWith(MADE_PREFIX) && v?.sid === sid)
+    .map(([k, v]) => ({ id: Number(k.slice(MADE_PREFIX.length)), at: Number(v?.at) || 0 }))
+    .sort((a, b) => a.at - b.at);
+  if (mine.length <= TAB_CAP) return;
+  const live = new Set(await liveList());
+  const drop = mine.slice(0, mine.length - TAB_CAP)
+    .map((t) => t.id)
+    .filter((id) => id !== keepTabId && !ownedByOtherLive(all, id, sid, live));
+  if (drop.length) await chrome.tabs.remove(drop).catch(() => {});
+}
+
+// ② 会话回收 + 定期清扫。alarm 每 30 秒调一次；没有盖章的页时只花一次 storage 读。
+async function reclaimIdleTabs() {
+  if (!patchOn('reclaim')) return;
+  const all = await chrome.storage.local.get(null);
+  const made = Object.entries(all).filter(([k]) => k.startsWith(MADE_PREFIX));
+  if (!made.length) return;
+  const live = new Set(await liveList());
+  const now = Date.now();
+  const drop = [];
+  for (const [k, v] of made) {
+    if (!v?.sid || live.has(v.sid)) continue;
+    // 会话下线后从「最后一条命令」起算宽限期；从没记过 lastSeen 的老数据退回开页时间。
+    const seen = Number(all[lastSeenKey(v.sid)]) || Number(v.at) || 0;
+    if (now - seen < RECLAIM_GRACE_MS) continue;
+    const id = Number(k.slice(MADE_PREFIX.length));
+    if (!ownedByOtherLive(all, id, v.sid, live)) drop.push(id);
+  }
+  if (drop.length) await chrome.tabs.remove(drop).catch(() => {});
+}
+
+// 两类都算：还在我们组里的，以及盖过 madeBy 记号但会话已离线的（摘组后仍能找回）。
+// 补丁装上前开的页没有 madeBy 记号（用户已经看到的那一堆）。自动关它们太危险——
+// 那时还没有「谁开的」证据，继承来的用户页也混在组里。只提供显式入口：
+// 关掉花叔标签组里、**没有任何在线会话占着**的页。只在用户点按钮时执行。
+async function orphanAgentTabs() {
+  if (!(await localPatchOn())) return [];
+  const all = await chrome.storage.local.get(null);
+  const groups = new Set(Object.entries(all)
+    .filter(([k]) => k.startsWith('agentGroup:'))
+    .map(([, gid]) => gid));
+  // 换成本地构建之后，旧扩展的 storage 跟着旧扩展一起没了，组 id 无从查起。
+  // 所以再按组名兜底一次，判据和 groupTitleOk 同源：「花叔」或某个会话的 emoji。
+  const titles = new Set([GROUP_TITLE, ...MARK_PALETTE.map((m) => m.emoji)]);
+  const titleGids = new Set((await chrome.tabGroups?.query({}) || [])
+    .filter((g) => titles.has(g.title))
+    .map((g) => g.id));
+  const live = new Set(await liveList());
+  const tabs = await chrome.tabs.query({});
+  const noOwner = (t) => !sidsOnTab(all, t.id).some((sid) => live.has(sid));
+  const hit = tabs.filter((t) => {
+    if (t.incognito || !noOwner(t)) return false;
+    // ① 还在我们建的组里：补丁装上前就开着的页走这条
+    if (t.groupId !== -1 && (groups.has(t.groupId) || titleGids.has(t.groupId))) return true;
+    // ② 有「agent 开的」记号：会话断开后页会被摘出组，但记号还在。
+    //    不认这条的话，会话一断这些页就成了没人管的散页，永远盘点不到。
+    return all[madeKey(t.id)] !== undefined;
+  });
+  // 页数和会话数是两个问题：5 个页可能只来自 1 个断掉的会话。
+  // 用户看到「N 个页」时第一反应是 N 个会话，所以两个数都要能说出来。
+  const sids = new Set();
+  for (const t of hit) {
+    for (const sid of sidsOnTab(all, t.id)) if (!live.has(sid)) sids.add(sid);
+    const made = all[madeKey(t.id)];
+    if (made?.sid && !live.has(made.sid)) sids.add(made.sid);
+  }
+  return Object.assign(hit, { sessions: [...sids] });
+}
 
 // 这个标签页此刻的主人们。只算**还连着**的会话——判据和 liveOwnersOf 一致：
 // 已结束的会话留下的槽不算数，否则关掉一个终端窗口之后，它的标记会永远挂在那儿。
@@ -794,6 +947,7 @@ async function syncGroup(tabId, owners) {
     }
   } catch { /* 标签页正被拖动/已关、API 不可用——都不是命令的错 */ }
 }
+
 
 // 会话名单变了（有人下线），所有可能带着标记的标签页都得重算一遍。
 // 不能只看「还活着的会话占的页」——恰恰是**刚死掉那个**占的页需要被摘。
@@ -1395,6 +1549,14 @@ const RECENT_TABS = 'recentTabs';
 const RECENT_CAP = 20;
 
 chrome.tabs.onCreated.addListener(async (tab) => {
+  noteGuardTab(tab);   // 同步：激活判据不能等 storage
+  // 开页那一刻就按回去：onCreated 比 onActivated 早一步，赶在浏览器把新页画出来之前
+  // 归还，用户就看不到「闪一下」。同步调用、不做任何 await——晚一个 await 就是一帧。
+  // 判据和 settleFront 是同一个：只还「这次动作登记过的页」。只看窗口的话，别的会话
+  // 在同一窗口开的页也会被按回去——实测两个会话同窗开页，前台被来回拉了三次。
+  if (patchOn('frontGuard') && frontGuard && frontGuard.opened.has(tab.id)) {
+    void chrome.tabs.update(frontGuard.backTo, { active: true }).catch(() => { /* 原来那页已关 */ });
+  }
   const { [RECENT_TABS]: list = [] } = await chrome.storage.session.get(RECENT_TABS);
   list.push({ id: tab.id, opener: tab.openerTabId, win: tab.windowId, at: Date.now() });
   await chrome.storage.session.set({ [RECENT_TABS]: list.slice(-RECENT_CAP) });
@@ -1422,6 +1584,116 @@ async function childOpenedSince(openerId, since) {
     return null;   // 开完又被关掉了（有些站点用它做中转）
   }
 }
+
+// 把前台还给用户原来那页。
+//
+// 页面自己 window.open 出来的子页，Chrome 默认把它设成前台——用户正在读的页被顶掉，
+// 而扩展只是「跟过去」，主观上根本没想抢。所以跟过去之后原样还回去。
+//
+// 只在两条都成立时动手：子页和原来那页在同一窗、且子页此刻确实是前台。
+// 缺一条就说明前台不是这次操作弄丢的（用户自己切走了、或那是另一个窗口），
+// 这时再动一次 tabs.update 只会更吵。
+async function restoreFront(prevId, childId) {
+  if (!prevId || prevId === childId) return false;
+  try {
+    const [prev, childTab] = await Promise.all([chrome.tabs.get(prevId), chrome.tabs.get(childId)]);
+    if (prev.windowId !== childTab.windowId || !childTab.active) return false;
+    await chrome.tabs.update(prevId, { active: true });
+    return true;
+  } catch {
+    return false;   // 原来那页在这期间被关了
+  }
+}
+
+// 页面主世界里的 window.open 替换。
+//
+// 站点用 window.open / target=_blank 开出来的页，Chrome 会把它切成前台——扩展事后
+// 只能「切回来」，而切回来之前那一帧已经画出来了，用户看到的就是闪一下。想真无感，
+// 唯一的办法是不让它前台打开：把 URL 递回扩展，由扩展以 active:false 建页。
+//
+// 不看窗口名。窗口名只说明调用方想要一个句柄，跟这次开页该不该到前台没有关系：
+// 用它区分会把不带窗口名的登录弹窗拦进后台，也会把带了名字的普通开页放过去抢前台。
+// 哪些场景该让页到前台，由 standDownFront 按明确信号放通，不在这里猜。
+// 替换是幂等的，注入在每次动作之前。
+function pageOpenShim() {
+  if (window.__hcOpenHooked) return;
+  window.__hcOpenHooked = true;
+  const orig = window.open;
+  window.open = function (url) {
+    try {
+      if (typeof url === 'string' && /^https?:/i.test(url)) {
+        window.postMessage({ __hcOpenBg: true, url }, '*');
+        return null;
+      }
+    } catch { /* 退原路 */ }
+    return orig.apply(window, arguments);
+  };
+}
+
+// 前台护栏：**开页那一刻就拉回来**，不靠延迟轮询。
+//
+// 站点 window.open 出来的页会被 Chrome 切成前台（实测连开两个，第二个晚一秒又来一次）。
+// chrome.tabs.onActivated 在切换发生的同时就响，这里直接判断「切过去的这页是不是
+// 这次动作开出来的」，是就立刻把关标还给用户原来那页。比 setTimeout 轮询快一个数量级，
+// 也不会出现「用户已经看了一秒才被拉回」的观感。
+//
+// 判据用 RECENT_TABS（onCreated 记账）：只有「动作开始之后创建」的页才还，
+// 用户自己点的页、别的会话的页都不在这个集合里——这也是和多会话隔离共存的前提。
+let frontGuard = null;   // { backTo, winId, since, until }
+
+// 撤防：这一拍之后开出的页不再被按回后台。
+//
+// 护栏默认把「这次动作开出来的页」切回后台，因为页面自己开的页不该抢用户的前台。
+// 但有的动作意义就是让用户看见那个页，前台是它要的结果。这类动作不在这里列举——
+// 列举就会漏。要抢前台一律走 takeFront：它先撤防再聚焦，新增一种场景只是多一处
+// 调用，不用记得还要来这里登记。直接 chrome.tabs.update({active:true}) 会把
+// 这次动作开出的页按回后台，test/front-guard.test.js 会拦住这种写法。
+function standDownFront() {
+  frontGuard = null;
+}
+
+// 把一个标签页切到前台，并让护栏给它让路。reason 写明凭什么抢
+// （支付确认、调用方传了 focus、正在请用户看这个页），只进注释不进逻辑。
+async function takeFront(tabId, reason) {
+  void reason;
+  standDownFront();
+  const tab = await chrome.tabs.get(tabId);
+  await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  await chrome.tabs.update(tabId, { active: true });
+  return tab;
+}
+
+async function armFrontGuard(backTo, winId) {
+  if (!patchOn('frontGuard') || !backTo) return;
+  // 记下动作开始那一刻窗口在不在前台：只有「本来不在前台、被页面拉到前台」才去还焦点，
+  // 用户自己就在浏览器里操作时不该动他。
+  const w = await chrome.windows.get(winId).catch(() => null);
+  frontGuard = {
+    backTo, winId, wasFocused: !!w?.focused,
+    since: Date.now(), until: Date.now() + 5000, opened: new Set(),
+  };
+}
+
+// 「这次动作开出来的页」记在内存里、由 onCreated 同步登记。
+// 不能用 storage 里的 recentTabs 当判据：激活往往比那条异步记账先到，查不到就漏，
+// 实测就是这么漏的（日志里两次前台切换、一次归还都没有）。
+function noteGuardTab(tab) {
+  if (!frontGuard || Date.now() > frontGuard.until) return;
+  if (tab.windowId !== frontGuard.winId) return;
+  frontGuard.opened.add(tab.id);
+}
+
+async function settleFront(tabId, windowId) {
+  if (!patchOn('frontGuard') || !frontGuard || tabId === frontGuard.backTo) return;
+  if (Date.now() > frontGuard.until) { frontGuard = null; return; }
+  if (windowId !== frontGuard.winId) return;
+  if (!frontGuard.opened.has(tabId)) return;   // 不是你这次开的页，不碰
+  await chrome.tabs.update(frontGuard.backTo, { active: true }).catch(() => { /* 原来那页已关 */ });
+}
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  void settleFront(tabId, windowId);
+});
 
 // agent 自己导航到的地方不算漂移
 const markNavigated = async (tabId, sid) => {
@@ -1524,9 +1796,8 @@ function pollPanel(id, timeout) {
 let payTimeout = 180000;
 
 async function confirmPay(id, pay) {
-  const tab = await chrome.tabs.get(id);
-  await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-  await chrome.tabs.update(id, { active: true });
+  // 支付确认就是要用户看着这个页点头
+  const tab = await takeFront(id, '支付确认');
   await chrome.scripting.executeScript({ target: { tabId: id }, files: ['mark.js'] });
 
   chrome.notifications?.create(`hc-pay-${Date.now()}`, {
@@ -1631,6 +1902,21 @@ const writesText = (ws) => ws.slice(0, 4).map((w) => `${w.m} ${w.u} → ${w.s ==
 async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
   const { frameId, params } = await prepare(id, p);
   const before = (await chrome.tabs.get(id)).url;
+  const tabBefore = await chrome.tabs.get(id);
+  // 前台保护（本地补丁）：站点 window.open / target="_blank" 开出来的子页，Chrome 会
+  // 把它切成前台，用户正在看的那页被顶掉——扩展只是跟过去，从来没想过要抢。
+  // 先在页面里拦下：链接点击和 window.open 都改由扩展以 active:false 建页，浏览器
+  // 根本不会切前台。拦不住的由护栏兜底，新页被切上来的那一刻还回去。
+  const fgOn = patchOn('frontGuard');
+  if (fgOn) {
+    void chrome.scripting.executeScript({ target: { tabId: id }, world: 'MAIN', func: pageOpenShim })
+      .catch(() => { /* 页面不允许注入（chrome://、扩展页）就退回护栏 */ });
+    void toContent(id, { __hcArmLinks: true }).catch(() => { /* 没有内容脚本就退回护栏 */ });
+  }
+  const frontBefore = fgOn
+    ? (await chrome.tabs.query({ active: true, windowId: tabBefore.windowId }))[0]?.id
+    : null;
+  await armFrontGuard(frontBefore, tabBefore.windowId);
   const startedAt = Date.now();
 
   // 定位：resolve、滚动、遮挡检测全在 content script 里做（一行没改），
@@ -1765,8 +2051,15 @@ async function performCore(id, cmd, p, { blockSensitive = false } = {}, ctx) {
     await waitForReady(child.id);
     await setActiveTabId(child.id);
     await claimTab(ctx?.sid, child.id, ctx);
+    await markMade(ctx?.sid, child, 'child');   // 点出来的新页也是 agent 开的
+    await capSessionTabs(ctx?.sid, child.id);
     await markNavigated(child.id, ctx?.sid);
-    return { note, l2note, ev, navigated, upgraded, followed: { from: id, to: child.id, url: child.url, how: child.how } };
+    const front = patchOn('frontGuard') ? await restoreFront(frontBefore, child.id) : false;
+    return {
+      note: front ? `${note}（前台已还给你原来那页）` : note,
+      l2note, ev, navigated, upgraded, frontRestored: front,
+      followed: { from: id, to: child.id, url: child.url, how: child.how },
+    };
   }
 
   return { note, l2note, ev, navigated, upgraded };
@@ -1857,7 +2150,15 @@ function effectLines({ note, l2note, ev, upgraded, followed }) {
 
 async function perform(id, cmd, p, ctx) {
   const drift = await driftNote(id, ctx?.sid);
-  const r = await performCore(id, cmd, p, {}, ctx);
+  let r;
+  try {
+    r = await performCore(id, cmd, p, {}, ctx);
+  } finally {
+    // 动作一结束就撤防：布防只是为了这次动作期间拦下页面自己开的新标签。
+    // 不撤的话，用户在这之后几秒内自己点「新标签打开」的链接也会被拦到后台。
+    // performCore 有多条 return，用 finally 才不会漏。
+    await toContent(id, { __hcDisarmLinks: true }).catch(() => {});
+  }
   // 跟到新标签页了就拍新的那个——拍老的等于把 agent 留在它已经离开的页面上
   const snap = await snapshotAll(r.followed ? r.followed.to : id);
   const head = [drift, effectLines(r)].filter(Boolean).join('\n');
@@ -2451,8 +2752,8 @@ const HANDLERS = {
             `在那之前，要截它必须切到前台——传 focus:true 显式同意打断用户，` +
             `或者先用 snapshot / read_text 读内容（不需要前台）。`);
         }
-        await chrome.tabs.update(id, { active: true });
-        await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        // 调用方显式传了 focus:true，同意打断用户
+        await takeFront(id, '截图 focus:true');
         await sleep(250);
         // 切换可能没成功（窗口最小化、被别的窗口盖住）。不确认就截，
         // 截到的还是用户那一页——这正是第二次事故的成因。
@@ -2497,12 +2798,20 @@ const HANDLERS = {
           else if (live.has(owner)) taken.add(t.id);
         }
       }
+      // 组归属也标出来：标签栏被压到只剩 favicon 时，组是唯一还看得见的信号，
+      // 而「这页到底在不在我们建的组里」排查时全靠这一列。
+      const ourGids = new Set(Object.entries(slots)
+        .filter(([k]) => k.startsWith('agentGroup:')).map(([, v]) => v));
       const lines = all.map((t) => {
         const mark = t.id === mine ? ' *' : taken.has(t.id) ? ' ×' : mineToo.has(t.id) ? ' +' : '  ';
         const lb = slots[labelKey(t.id)];
-        return `[${t.id}]${mark}${lb ? `「${lb}」` : ''} ${t.title || '(无标题)'} — ${t.url}`;
+        const grp = t.groupId === -1 ? '' : ourGids.has(t.groupId) ? `⟨组${String(t.groupId).slice(-3)}⟩` : '⟨别组⟩';
+        return `[${t.id}]${mark}${grp}${lb ? `「${lb}」` : ''} ${t.title || '(无标题)'} — ${t.url}`;
       });
-      return { text: `共 ${all.length} 个标签页（* = 你的缺省槽，+ = 你的另一条工作线，× = 别的会话在用；「」= 开页时声明的 label）\n` + lines.join('\n') };
+      return {
+        text: `共 ${all.length} 个标签页（* = 你的缺省槽，+ = 你的另一条工作线，× = 别的会话在用；⟨组NNN⟩ = 我们的标签组；「」= 开页时声明的 label）\n`
+          + lines.join('\n'),
+      };
     }
     // active:false —— agent 在后台干活，不把用户从他正在看的页面上拽走。
     // 需要抢焦点的场合（截图、让用户看着操作）由调用方显式传 focus:true。
@@ -2512,6 +2821,8 @@ const HANDLERS = {
       if (label) await chrome.storage.local.set({ [labelKey(tab.id)]: label });
       await setActiveTabId(tab.id);   // 全局槽照旧更新：它是「最近受控 tab」的继承源
       await claimTab(sid, tab.id, ctx);
+      await markMade(sid, tab, 'new');   // 盖章：这页是 agent 自己开的，回收只管这种
+      await capSessionTabs(sid, tab.id);
       if (p.url) await waitForReady(tab.id, { expectNav: true });
       // 出生证：tabId 必须被 agent 转述进对话才能活过上下文压缩，
       // 回执里把「该记什么、怎么找回」一次说全
@@ -2523,6 +2834,25 @@ const HANDLERS = {
         tabId: tab.id,
       };
     }
+    // 只读：盘点遗留页，和侧栏那个「清理」按钮同一套判据
+    if (p.action === 'orphans') {
+      const list = await orphanAgentTabs();
+      const ns = (list.sessions || []).length;
+      return { text: `遗留页 ${list.length} 个${ns ? `（来自 ${ns} 个已离线会话）` : ''}${list.length ? '：' + list.map((t) => t.id).join(',') : ''}` };
+    }
+    // 本地补丁的开关入口：给自动化测试用。侧栏能点的这里都能设，
+    // 全量测试靠它在「开/关」两种状态下各跑一遍，不用人去点面板。
+    // key 只认 PATCH_KEYS 里的值，写错了直接报，不静默忽略。
+    if (p.action === 'patch') {
+      const entry = Object.entries(PATCH_KEYS).find(([, v]) => v === p.key);
+      if (!entry) return { text: '未知开关 ' + p.key };
+      const [slot, key] = entry;
+      await chrome.storage.local.set({ [key]: !!p.on });
+      // 直接改缓存，不等 storage.onChanged：同值写入不会触发事件，
+      // 而测试要的是「设完立刻生效」，等事件会拿到上一轮的状态。
+      patchCfg = { ...patchCfg, [slot]: !!p.on };
+      return { text: `${key} = ${!!p.on}（缓存 ${JSON.stringify(patchCfg)}）` };
+    }
     // 「受控」和「前台」是两件事：这里只改受控目标，不动用户的视线
     if (p.action === 'select') {
       const id = await resolveTab(p.tabId, sid, ctx);
@@ -2531,7 +2861,7 @@ const HANDLERS = {
       if (label) await chrome.storage.local.set({ [labelKey(id)]: label });
       await setActiveTabId(id);
       await claimTab(sid, id, ctx);
-      if (p.focus) await chrome.tabs.update(id, { active: true });
+      if (p.focus) await takeFront(id, '切换受控标签 focus:true');
       return { text: warn + `受控标签页切到 [${id}]${label ? `「${label}」` : ''}` };
     }
     if (p.action === 'close') {
@@ -2570,9 +2900,8 @@ const HANDLERS = {
     }
 
     if (p.focus !== false) {
-      const tab = await chrome.tabs.get(id);
-      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-      await chrome.tabs.update(id, { active: true });
+      // 没传 focus:false，就是在请用户看这个页
+      await takeFront(id, 'ask');
     }
 
     // ask 的浮条并进了 mark.js（统一呈现层），协议没变，只是换了宿主文件
@@ -2688,6 +3017,7 @@ cdp.reapOrphans();
 // 没连上就先把 offscreen 扶起来，还不行就自己顶上——这是「装完就自动连上、
 // 永远不需要用户手点」的最后一道保险，所以判据必须是连通性本身。
 chrome.alarms?.onAlarm.addListener(async () => {
+  void reclaimIdleTabs();   // 定期清扫：会话离线后把它自己开的页收掉
   await ensureOffscreen();
   if (await connected()) return setBadge(true);
   // 先让 offscreen 那条腿尽力——kick 会等它把五个端口探完再回话。
@@ -2705,6 +3035,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   const all = await chrome.storage.local.get(null);
   const dead = Object.keys(all).filter((k) => (k === 'activeTabId' || k.startsWith('agentTab:')) && all[k] === tabId);
   if (all[labelKey(tabId)] !== undefined) dead.push(labelKey(tabId));
+  if (all[madeKey(tabId)] !== undefined) dead.push(madeKey(tabId));
   if (dead.length) await chrome.storage.local.remove(dead);
   // 户口簿是数组，摘条目而不是删键
   const shrunk = {};
@@ -2771,6 +3102,29 @@ chrome.runtime.onMessage.addListener((m, sender, sendResponse) => {
 
   // 页内小头像被点了：打开这个窗口的侧栏。sidePanel.open 要求用户手势，
   // 内容脚本在 click 里发来的消息带着这次手势（Chrome 116+）。
+  // 页面主世界拦下的 window.open：由扩展在**后台**建页，浏览器不会切前台。
+  if (m?.__hcOpenBg && sender?.tab) {
+    void (async () => {
+      const src = sender.tab;
+      const url = String(m.__hcOpenBg).slice(0, 2000);
+      if (!/^https?:/i.test(url)) return;
+      // 紧跟同组末尾，和 tabs(new) 一致；组外就落在原页后面
+      let index;
+      if (src.groupId !== -1) {
+        const inGroup = (await chrome.tabs.query({ windowId: src.windowId }))
+          .filter((t) => t.groupId === src.groupId)
+          .sort((a, b) => a.index - b.index);
+        const tail = inGroup[inGroup.length - 1];
+        if (tail) index = tail.index + 1;
+      }
+      // openerTabId 得带上：新页是扩展建的，不声明来源的话浏览器不记父子关系，
+      // 后面「这次点击开出来的页」就只能退回去猜「同窗口里刚出现的那个」。
+      await chrome.tabs.create({ url, active: false, windowId: src.windowId, openerTabId: src.id, ...(index === undefined ? {} : { index }) })
+        .catch(() => { /* 窗口没了就算了 */ });
+    })();
+    return false;
+  }
+
   if (m?.__hcPanel === 'open' && sender.tab) {
     chrome.sidePanel.open({ windowId: sender.tab.windowId })
       .then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: e.message }));
@@ -2786,6 +3140,23 @@ chrome.runtime.onMessage.addListener((m, sender, sendResponse) => {
 
   if (m.__hcPopup === 'status') {
     connState().then(sendResponse);
+    return true;
+  }
+  // 遗留页盘点：补丁装上前开的页没有 madeBy 记号，自动回收不敢碰它们，
+  // 只能在侧栏里给用户一个数着关的入口。
+  if (m.__hcPopup === 'orphans') {
+    orphanAgentTabs()
+      .then((tabs) => sendResponse({ count: tabs.length, sessions: (tabs.sessions || []).length }))
+      .catch(() => sendResponse({ count: 0, sessions: 0 }));
+    return true;
+  }
+  if (m.__hcPopup === 'reclaimOrphans') {
+    orphanAgentTabs()
+      .then(async (tabs) => {
+        if (tabs.length) await chrome.tabs.remove(tabs.map((t) => t.id)).catch(() => {});
+        sendResponse({ closed: tabs.length });
+      })
+      .catch(() => sendResponse({ closed: 0 }));
     return true;
   }
   if (m.__hcPopup === 'connect') {
