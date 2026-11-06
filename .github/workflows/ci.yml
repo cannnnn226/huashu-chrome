@@ -1,0 +1,26 @@
+# 提 PR 和合进 master 时跑一遍单测。
+#
+# 只跑 npm test（不需要浏览器）；真机那套 test:live 要连着日常 Chrome，放在 CI 里
+# 没有意义，本地跑。master 的分支保护要求这个检查通过，没有它保护就只剩「必须走 PR」
+# 一条形式规则，合进去的代码没人验证过。
+name: ci
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - run: npm ci
+
+      - run: npm test
