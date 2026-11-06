@@ -54,6 +54,33 @@ CLI 是入口（install / mcp / doctor），MCP server 是 agent 的接口，本
 | 前台诊断 | 记录谁把前台切走了，`tabs(list)` 回放最近 20 条 | 没有 |
 | 遗留标签页 | 手动清理会话断开后留下的页（一键，不是开关） | 没有 |
 
+### 装这个版本
+
+**不能走 `npx huashu-chrome install`** —— 那条命令装的是 npm 上的官方包，没有上面
+这些功能。本仓库的代码只在这棵树里。
+
+```bash
+git clone https://github.com/cannnnn226/huashu-chrome
+cd huashu-chrome
+npm install
+node src/cli.js install
+```
+
+`install` 会检测机器上的 agent、写各自的 MCP 配置，指向**这份源码**而不是 npx。
+扩展这一步和官方一样手动做：`chrome://extensions` → 打开开发者模式 → 加载已解压 →
+选本仓库的 `extension` 目录。manifest 里带了 key，扩展 id 是固定的，MCP 配置不用跟着改。
+
+以后 `git pull` 更新代码，在扩展管理页点一次「重新加载」即可。
+
+**想用官方版本**，请去 [alchaincyf/huashu-chrome](https://github.com/alchaincyf/huashu-chrome)。
+拉这个仓库等于在这个基础上再改一层，官方更新需要自己合。
+
+本仓库基于 MIT 协议的 huashu-chrome 修改，原始版权归 [花叔 (alchaincyf)](https://github.com/alchaincyf) 所有，
+`LICENSE` 原样保留。
+
+**给官方提 PR** 一律从官方 `master` 拉新分支，不带上面这些本地功能；
+上游合入之后，对应的本地灰度项就可以删掉，改走官方实现。
+
 **想用官方版本**，请去 [alchaincyf/huashu-chrome](https://github.com/alchaincyf/huashu-chrome)。
 拉这个仓库等于在这个基础上再改一层，官方更新需要自己合。
 
